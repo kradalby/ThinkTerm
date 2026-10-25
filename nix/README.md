@@ -28,7 +28,9 @@ service module; this unit is a test fixture, not a new deployment interface.
 
 Only `tailnet-test` enables `thinkterm-tailnet/testkit`. This feature permits
 plain HTTP control URLs and enables `ts_control/insecure-keyfetch` and
-`ts_control/insecure-derp`. Shipping packages retain HTTPS validation and normal
+`ts_control/insecure-derp`. It also forwards existing library tracing events to the
+private node log so outage checks can observe stream termination and retry before
+testing fresh IPv4/IPv6 payloads. Shipping packages retain HTTPS validation and normal
 DERP certificate verification. A separate test without the feature checks URL
 validation. The kit's self-signed TLS endpoint serves control/DERP, not application
 HTTPS. ThinkTerm's integration exposes no HTTPS listener.

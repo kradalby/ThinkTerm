@@ -80,6 +80,36 @@ def traffic(host):
     client.wait_until_succeeds(probe(host), timeout=T)
 
 
+def control_outage():
+    pid = connected()["pid"]
+    inode = client.succeed(f"stat -c %i {SOCKET}")
+    log = f"/run/thinkterm-test/thinkterm/thinkterm-tailnet-log-{pid}.txt"
+    offset = int(client.succeed(f"stat -c %s {log}"))
+    headscale.succeed("systemctl stop headscale")
+    # An immediate probe can race the old actor. Require its end and a replacement's failed dial.
+    restarted = f"""from pathlib import Path
+with Path({log!r}).open('rb') as log:
+    log.seek({offset})
+    events = log.read()
+ended = events.find(b'state update stream terminated')
+assert ended >= 0, events
+assert b'control dial failed; retrying' in events[ended:], events
+assert b'starting the node anew' not in events, events
+"""
+    client.wait_until_succeeds("python3 -c " + shlex.quote(restarted), timeout=T)
+    client.wait_until_succeeds(
+        f"jq -e '.pid == {pid} and .status.state == \"starting\"' {REPORT}",
+        timeout=T,
+    )
+    for family in ("v4", "v6"):
+        client.succeed(probe("direct", family=family))
+    headscale.fail("systemctl is-active headscale")
+    assert report()["pid"] == pid
+    assert report()["status"]["state"] == "starting"
+    assert client.succeed(f"stat -c %i {SOCKET}") == inode
+    client.succeed("python3 -c " + shlex.quote(restarted))
+
+
 def ssh_command(ip):
     return (
         "ssh -i /tmp/id -o BatchMode=yes -o StrictHostKeyChecking=no "
@@ -345,8 +375,7 @@ with subtest("control reconnect delivers new policy without a process restart"):
     pid = connected()["pid"]
     for machine in (direct, relay):
         machine.succeed(ssh_command(ip))
-    headscale.succeed("systemctl stop headscale")
-    traffic("direct")
+    control_outage()
     headscale.succeed("systemctl start headscale")
     headscale.wait_until_succeeds("headscale health", timeout=T)
     headscale.succeed(f"headscale policy set -f {RESTRICTED}")
@@ -367,8 +396,7 @@ with subtest("control reconnect delivers new policy without a process restart"):
     assert connected()["status"]["address"] == ip
 
 with subtest("control outage and watchdog recovery"):
-    headscale.succeed("systemctl stop headscale")
-    traffic("direct")
+    control_outage()
     # Start a persisted node while control is unavailable; recovery must not need
     # a settings change, a new auth key, or another process restart.
     client.succeed("systemctl restart thinkterm")
