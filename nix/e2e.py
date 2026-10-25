@@ -399,12 +399,16 @@ with subtest("control outage and watchdog recovery"):
     control_outage()
     # Start a persisted node while control is unavailable; recovery must not need
     # a settings change, a new auth key, or another process restart.
+    previous_pid = report()["pid"]
     client.succeed("systemctl restart thinkterm")
+    # The old Starting report and socket can outlive their process.
     client.wait_until_succeeds(
-        f"jq -e '.status.state != \"connected\"' {REPORT}", timeout=T
+        f"jq -e '.pid != {previous_pid} and .status.state == \"starting\"' {REPORT}",
+        timeout=T,
     )
     client.wait_until_succeeds(f"test -S {SOCKET}", timeout=T)
     waiting_pid = report()["pid"]
+    client.succeed(f"kill -0 {waiting_pid}")
     client.succeed(
         f"inotifywait -t 90 -e delete_self {SOCKET} > /tmp/watchdog-event 2>&1 &"
     )
