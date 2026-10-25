@@ -190,8 +190,13 @@ control reconnect (ts_runtime)
     lets actor shutdown cancel them. A restarted control actor reloads
     retained endpoints and DERP measurements: its unchanged actor id does not receive retained
     subscriptions again. Registration rejection still reports the existing failure reason.
+    The runtime's retained bus also keeps the configured local address pair separately from
+    raw map updates, whose node-less deltas replace the last event. A restarted control actor
+    can answer fresh TCP source-address requests while control is unavailable without claiming
+    a current self-node or successful registration. New authoritative addresses replace the
+    pair; a new runtime starts without it, even with the same persisted keys.
     Drop when: upstream retries control outages without exhausting supervision and retains
-    the network state needed by the replacement map stream.
+    the network state needed by the replacement map stream and fresh dataplane connections.
 
 TCP replies (ts_dataplane)
     Apply inbound network grants to initiating TCP SYNs (SYN set, ACK clear), not replies.
@@ -226,8 +231,10 @@ build. The changes in behaviour have tests:
     netlink dump   netmon::tests in ts_runtime (initial links, addresses and routes)
     TCP replies    dataplane::tests in ts_runtime (IPv4/IPv6 encrypted stateless TCP, denied
                    SYN/UDP, source ownership, destination routing and malformed/fragmented TCP)
-    control reconnect control_runner::tests (an unreachable server leaves its supervisor alive);
-                   nix/e2e.py (direct payloads during an outage and new policy after reconnect)
+    control reconnect control_runner::tests (supervisor survival; address retention after a
+                   node-less delta and control restart, fresh status, cold runtime isolation
+                   and authoritative address replacement); nix/e2e.py (fresh IPv4/IPv6 payloads
+                   after observed stream termination/retry and new policy after reconnect)
     derp dial      multiderp::uniderp::tests (an unreachable region, becoming home, a
                    connection that does not come up, the next server)
     derp reads     client::tests in ts_derp (a connection gone quiet, keep-alives)
