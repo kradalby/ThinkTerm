@@ -3,6 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    headscale.url = "github:juanfont/headscale/2d220b2eb8be8d31ed603000d0b0be02c2cd94d0";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -32,6 +33,14 @@
       url = "github:pnggroup/libpng/v1.6.44";
       flake = false;
     };
+    lucide = {
+      url = "github:lucide-icons/lucide/071e4d27381bec932951a87c2598dfe8532b4974";
+      flake = false;
+    };
+    simple-icons = {
+      url = "github:simple-icons/simple-icons/9ad548078caad572c66a830314852b15937e639a";
+      flake = false;
+    };
     zlib = {
       url = "github:madler/zlib/v1.3.1";
       flake = false;
@@ -48,6 +57,12 @@
 
         inherit (inputs.nixpkgs) lib;
         inherit (pkgs) stdenv;
+
+        iconPatch = ''
+          rm -rf third_party/lucide third_party/simple-icons
+          ln -s ${inputs.lucide} third_party/lucide
+          ln -s ${inputs.simple-icons} third_party/simple-icons
+        '';
 
         nativeBuildInputs =
           with pkgs;
@@ -109,6 +124,7 @@
           };
 
           prePatch = ''
+            ${iconPatch}
             rm -rf deps/freetype/{freetype2,libpng,zlib} deps/harfbuzz/harfbuzz
 
             ln -s ${inputs.freetype2} deps/freetype/freetype2
@@ -184,6 +200,7 @@
                 meta
                 ;
 
+              prePatch = iconPatch;
               nativeBuildInputs = [ pkgs.pkg-config ];
 
               buildInputs = [ pkgs.openssl ];
@@ -193,6 +210,8 @@
                 "wezterm"
                 "--package"
                 "wezterm-mux-server"
+                "--package"
+                "thinkterm-tailnet-node"
               ];
 
               doCheck = false;
@@ -210,11 +229,47 @@
                 }
                 ''
                   mkdir -p $out/share/terminfo $out/nix-support
-                  tic -x -o $out/share/terminfo ${src}/termwiz/data/wezterm.terminfo
+                  tic -x -o $out/share/terminfo ${../termwiz/data/wezterm.terminfo}
                 '';
           };
 
           meta.mainProgram = "thinkterm";
+        };
+
+        packages.tailnet-test = self.packages.${system}.default.headless.overrideAttrs (old: {
+          # Editing the VM fixture must not rebuild the Rust package.
+          src = lib.cleanSourceWith {
+            src = old.src;
+            filter = path: type: path != "${toString old.src}/nix";
+          };
+          cargoBuildFlags = old.cargoBuildFlags ++ [
+            "--package"
+            "thinkterm-tailnet"
+            "--features"
+            "thinkterm-tailnet/testkit"
+          ];
+          doCheck = true;
+          # Also prove the shipping feature set still rejects plain HTTP.
+          postCheck = ''
+            cargo test --release --offline --jobs "$NIX_BUILD_CORES" --target ${stdenv.hostPlatform.rust.rustcTarget} --package ts_runtime --lib
+            cargo test --release --offline --jobs "$NIX_BUILD_CORES" --target ${stdenv.hostPlatform.rust.rustcTarget} --package thinkterm-tailnet --no-default-features --lib control_urls_get_a_scheme_when_typed_without
+          '';
+          cargoTestFlags = [
+            "--package"
+            "thinkterm-tailnet"
+            "--package"
+            "thinkterm-tailnet-node"
+            "--features"
+            "thinkterm-tailnet/testkit"
+          ];
+        });
+
+        checks = lib.optionalAttrs stdenv.isLinux {
+          tailnet = import ./e2e.nix {
+            inherit pkgs;
+            inherit (inputs) headscale;
+            package = self.packages.${system}.tailnet-test;
+          };
         };
 
         devShell = pkgs.mkShell {

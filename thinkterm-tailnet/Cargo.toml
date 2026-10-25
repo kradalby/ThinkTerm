@@ -12,6 +12,9 @@ publish = false
 # without the library in them.
 node = ["dep:tailscale", "dep:tokio", "dep:ts_control"]
 
+# Only for isolated Headscale VM tests; never enabled by release builds.
+testkit = ["node", "ts_control/insecure-keyfetch", "ts_control/insecure-derp"]
+
 [dependencies]
 anyhow.workspace = true
 config.workspace = true
