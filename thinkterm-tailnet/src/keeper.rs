@@ -239,13 +239,11 @@ fn start(program: &Path) -> std::io::Result<Child> {
 mod tests {
     use super::*;
 
-    /// A program in `dir` that runs `script` as sh would.
-    fn program(dir: &Path, name: &str, script: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+    // Immutable scripts avoid ETXTBSY when tests create processes concurrently.
+    fn program(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
     }
 
     /// Steps `keeper` at `now` until the program it ran has ended.
@@ -269,8 +267,7 @@ mod tests {
 
     #[test]
     fn the_program_runs_while_the_tailnet_is_on() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut keeper = Keeper::new(program(dir.path(), "stays", "sleep 5"));
+        let mut keeper = Keeper::new(program("sleep.sh"));
         let now = Instant::now();
         keeper.step(false, now);
         assert!(keeper.child.is_none(), "started while the tailnet is off");
@@ -283,8 +280,7 @@ mod tests {
 
     #[test]
     fn a_program_that_keeps_ending_waits_longer_each_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut keeper = Keeper::new(program(dir.path(), "ends", "exit 3"));
+        let mut keeper = Keeper::new(program("exit-3.sh"));
         let mut now = Instant::now();
         let mut waits = vec![];
         for _ in 0..8 {
@@ -303,8 +299,7 @@ mod tests {
 
     #[test]
     fn a_program_that_ran_long_enough_starts_again_after_the_first_wait() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut keeper = Keeper::new(program(dir.path(), "ends", "exit 3"));
+        let mut keeper = Keeper::new(program("exit-3.sh"));
         keeper.wait = RESTART_MAX;
         let started = Instant::now();
         keeper.step(true, started);
@@ -317,8 +312,7 @@ mod tests {
 
     #[test]
     fn a_program_that_ended_as_the_tailnet_went_off_starts_at_once_when_it_is_on() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut keeper = Keeper::new(program(dir.path(), "ends", "exit 0"));
+        let mut keeper = Keeper::new(program("exit-0.sh"));
         keeper.wait = RESTART_MAX;
         let now = Instant::now();
         keeper.step(true, now);
