@@ -1,0 +1,399 @@
+#![doc = include_str!("../README.md")]
+
+extern crate ts_disco_protocol as disco;
+
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use ts_bart::RoutingTable;
+use ts_overlay_router as or;
+use ts_packet::PacketMut;
+use ts_packetfilter::{FilterExt, IpProto};
+use ts_time::{Handle, Scheduler, TimeRange};
+use ts_transport::PeerId;
+use ts_tunnel::{Endpoint, NodeKeyPair};
+use ts_underlay_router as ur;
+
+pub mod async_tokio;
+mod packet_ident;
+
+pub use packet_ident::{PacketIdent, PacketType};
+
+/// Duration without traffic after which to remove a peer from the active map.
+const PEER_EXPIRATION: Duration = Duration::from_secs(45);
+
+/// A data plane subsystem that can be the subject of timer events.
+pub enum Subsystem {
+    /// The wireguard component.
+    Wireguard,
+
+    /// Peer activity garbage collection.
+    PeerGc,
+}
+
+/// Transforms packets to make tailscale happen.
+pub struct DataPlane {
+    /// Wireguard encryption/decryption.
+    pub wireguard: Endpoint,
+
+    /// Outbound overlay router.
+    pub or_out: or::outbound::Router,
+    /// Outbound underlay router.
+    pub ur_out: ur::outbound::Router,
+
+    /// Inbound source filter.
+    pub src_filter_in: Arc<ts_bart::Table<PeerId>>,
+    /// Inbound overlay router.
+    pub or_in: or::inbound::Router,
+
+    /// The packet filter.
+    pub packet_filter: Arc<dyn ts_packetfilter::Filter + Send + Sync>,
+
+    /// Per-peer timestamps of last outgoing data packets.
+    ///
+    /// Used to determine whether we should be running path discovery for this peer.
+    pub active_peers: HashMap<PeerId, Instant>,
+
+    /// Events queued for future processing.
+    pub events: Scheduler<Subsystem>,
+
+    /// Next event for the wireguard subsystem.
+    pub wg_next: Option<Handle<Subsystem>>,
+
+    /// Next event for the peer gc subsystem.
+    pub peer_gc_next: Option<Handle<Subsystem>>,
+}
+
+impl DataPlane {
+    /// Creates a new data plane for a wireguard node key.
+    pub fn new(my_key: NodeKeyPair) -> Self {
+        DataPlane {
+            wireguard: Endpoint::new(my_key),
+            or_out: Default::default(),
+            ur_out: Default::default(),
+            src_filter_in: Default::default(),
+            or_in: Default::default(),
+            events: Default::default(),
+            packet_filter: Arc::new(ts_packetfilter::DropAllFilter),
+            active_peers: Default::default(),
+            wg_next: None,
+            peer_gc_next: None,
+        }
+    }
+
+    /// Pad `packets` to a 16-byte boundary, as required by `ts_tunnel`.
+    fn pad_packets(packets: &mut Vec<PacketMut>) {
+        const PAD_ALIGN: usize = 16;
+        for p in packets {
+            let m = p.len() % PAD_ALIGN;
+            if m != 0 {
+                p.grow_back(PAD_ALIGN - m);
+            }
+        }
+    }
+
+    /// Remove padding from `packets`.
+    ///
+    /// Packets which do not superficially match the structure of an IPv4 or IPv6 packet are
+    /// removed from `packets`.
+    fn unpad_packets(packets: &mut Vec<PacketMut>) {
+        packets.retain_mut(|packet| {
+            if let Some(sz) = packet.get_ip_len() {
+                packet.resize(sz);
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// Processes packets originating from the local device.
+    #[tracing::instrument(skip_all, fields(n_packets = packets.len()))]
+    pub fn process_outbound(&mut self, packets: Vec<PacketMut>) -> OutboundResult {
+        let or::outbound::Result {
+            to_wireguard,
+            loopback,
+        } = self.or_out.route(packets);
+
+        let now = Instant::now();
+
+        let to_wireguard = to_wireguard
+            .into_iter()
+            .map(|(id, mut packets)| {
+                self.active_peers.insert(id, now);
+                Self::pad_packets(&mut packets);
+                (ts_tunnel::PeerId(id.0), packets)
+            })
+            .collect::<Vec<_>>();
+
+        let ts_tunnel::SendResult {
+            to_peers: encrypted,
+        } = self.wireguard.send(Instant::now(), to_wireguard);
+
+        let to_peers = self
+            .ur_out
+            .route(encrypted.into_iter().map(|(k, v)| (PeerId(k.0), v)));
+
+        self.ensure_events(now);
+
+        OutboundResult { to_peers, loopback }
+    }
+
+    /// Processes packets received from elsewhere.
+    pub fn process_inbound(
+        &mut self,
+        packets: impl IntoIterator<Item = PacketMut>,
+    ) -> InboundResult {
+        let (wireguard, disco, stun) = packets.into_iter().fold(
+            (vec![], vec![], vec![]),
+            |(mut wg, mut disco, mut stun), pkt| {
+                let ident = PacketIdent::identify(pkt.as_ref());
+
+                match ident.ty {
+                    PacketType::Disco => {
+                        disco.push(pkt);
+                    }
+                    PacketType::StunBinding => {
+                        stun.push(pkt);
+                    }
+                    PacketType::Wireguard | PacketType::Unknown => wg.push(pkt),
+                }
+
+                (wg, disco, stun)
+            },
+        );
+
+        let ts_tunnel::RecvResult { to_local, to_peers } =
+            self.wireguard.recv(Instant::now(), wireguard);
+
+        let to_local = to_local
+            .into_iter()
+            .filter_map(
+                |(peer_id, mut packets)| -> Option<(ts_tunnel::PeerId, Vec<PacketMut>)> {
+                    Self::unpad_packets(&mut packets);
+                    if packets.is_empty() {
+                        None
+                    } else {
+                        Some((peer_id, packets))
+                    }
+                },
+            )
+            .map(|(peer_id, mut packets)| -> Vec<PacketMut> {
+                let _span = tracing::trace_span!(
+                    "src_filter_inbound",
+                    peer_id = ?peer_id,
+                    n_packet = packets.len(),
+                )
+                .entered();
+
+                packets.retain(|packet| {
+                    let Some(src) = packet.get_src_addr() else {
+                        tracing::trace!("does not look like ip packet");
+                        return false;
+                    };
+                    let verdict = if let Some(allowed_peer) = self.src_filter_in.lookup(src) {
+                        *allowed_peer == PeerId(peer_id.0)
+                    } else {
+                        tracing::trace!(remote_ip = %src, "unknown peer address");
+                        false
+                    };
+                    tracing::trace!(?src, verdict);
+                    verdict
+                });
+
+                packets
+            })
+            .map(|mut v| {
+                let _span =
+                    tracing::trace_span!("packet_filter_inbound", n_packet = v.len()).entered();
+
+                v.retain(|pkt| {
+                    let Ok(pkt) = etherparse::SlicedPacket::from_ip(pkt.as_ref()) else {
+                        tracing::trace!("does not look like ip packet");
+                        return false;
+                    };
+
+                    let (proto, src, dst) = match pkt.net {
+                        Some(etherparse::NetSlice::Ipv4(ipv4)) => (
+                            IpProto::new(ipv4.payload().ip_number.0 as _),
+                            ipv4.header().source_addr().into(),
+                            ipv4.header().destination_addr().into(),
+                        ),
+                        Some(etherparse::NetSlice::Ipv6(ipv6)) => (
+                            IpProto::new(ipv6.payload().ip_number.0 as _),
+                            ipv6.header().source_addr().into(),
+                            ipv6.header().destination_addr().into(),
+                        ),
+                        _ => {
+                            unreachable!("unexpected packet kind");
+                        }
+                    };
+
+                    let (_src_port, dst_port) = match pkt.transport {
+                        Some(etherparse::TransportSlice::Udp(udp)) => {
+                            (udp.source_port(), udp.destination_port())
+                        }
+                        Some(etherparse::TransportSlice::Tcp(tcp)) => {
+                            // ThinkTerm (TCP replies): return traffic needs no reverse grant, as in the Go client.
+                            if !tcp.syn() || tcp.ack() {
+                                return true;
+                            }
+                            (tcp.source_port(), tcp.destination_port())
+                        }
+                        _ => (0, 0),
+                    };
+
+                    let info = ts_packetfilter::PacketInfo {
+                        ip_proto: proto,
+                        port: dst_port,
+                        src,
+                        dst,
+                    };
+
+                    // TODO(npry): wire in nodecaps
+                    let caps = [];
+                    let verdict = self.packet_filter.can_access(&info, caps);
+
+                    tracing::trace!(?info, ?caps, verdict);
+
+                    verdict
+                });
+
+                v
+            });
+
+        let now = Instant::now();
+
+        let to_peers = to_peers
+            .into_iter()
+            .map(|(k, v)| (ts_transport::PeerId(k.0), v))
+            .inspect(|(id, _)| {
+                self.active_peers.insert(*id, now);
+            });
+
+        let to_local = self.or_in.route(to_local.flatten());
+        let to_peers = self.ur_out.route(to_peers);
+
+        self.ensure_events(now);
+
+        InboundResult {
+            to_local,
+            to_peers,
+            disco,
+            stun,
+        }
+    }
+
+    /// Return the next time at which [`DataPlane::process_events`] must be called.
+    ///
+    /// [`DataPlane::process_outbound`], [`DataPlane::process_inbound`] and
+    /// [`DataPlane::process_events`] may all update the next event time. Callers should prefer
+    /// calling `next_event` as needed to get a correct result, rather than store the returned
+    /// value.
+    pub fn next_event(&self) -> Option<Instant> {
+        self.events.next_dispatch()
+    }
+
+    /// Process all queued events that are due for processing.
+    ///
+    /// Must be called at least as often as dictated by [`DataPlane::next_event`] for the
+    /// data plane to function correctly. It is harmless to call it more frequently.
+    pub fn process_events(&mut self) -> ts_underlay_router::outbound::Result {
+        let mut to_peers = HashMap::new();
+        let now = Instant::now();
+        let mut should_gc = false;
+
+        for event in self.events.dispatch(now) {
+            match event {
+                Subsystem::Wireguard => {
+                    let res = self.wireguard.dispatch_events(now);
+                    to_peers.extend(
+                        res.to_peers
+                            .into_iter()
+                            .map(|(id, pkts)| (ts_transport::PeerId(id.0), pkts))
+                            .inspect(|(id, _)| {
+                                self.active_peers.insert(*id, now);
+                            }),
+                    );
+                }
+                Subsystem::PeerGc => should_gc = true,
+            }
+        }
+
+        if should_gc {
+            let _span =
+                tracing::trace_span!("peer gc", n_active_peers_pre = self.active_peers.len())
+                    .entered();
+
+            self.active_peers.retain(|id, &mut last_traffic| {
+                let elapsed = now - last_traffic;
+                let keep = elapsed < PEER_EXPIRATION;
+
+                if !keep {
+                    tracing::trace!(peer_id = %id, ?elapsed, "peer expired");
+                }
+
+                keep
+            });
+
+            tracing::trace!(n_active_peers_post = self.active_peers.len());
+
+            // remove so ensure_peer_gc sees there's no pending event and reschedules it
+            self.peer_gc_next = None;
+        }
+
+        let to_peers = self.ur_out.route(to_peers);
+        self.ensure_events(now);
+
+        to_peers
+    }
+
+    fn ensure_events(&mut self, now: Instant) {
+        self.ensure_wg();
+        self.ensure_peer_gc(now);
+    }
+
+    fn ensure_wg(&mut self) {
+        self.wg_next = self
+            .wireguard
+            .next_event()
+            .map(|tr| self.events.add(tr, Subsystem::Wireguard));
+    }
+
+    fn ensure_peer_gc(&mut self, now: Instant) {
+        if self.active_peers.is_empty() {
+            self.peer_gc_next = None;
+        } else if self.peer_gc_next.is_none() {
+            self.peer_gc_next = Some(self.events.add(
+                TimeRange::new_around(now + Duration::from_secs(10), Duration::from_millis(2500)),
+                Subsystem::PeerGc,
+            ));
+        }
+    }
+}
+
+/// The result of processing outbound packets.
+pub struct OutboundResult {
+    /// Packets to be sent into underlay transports for transmission.
+    pub to_peers: ts_underlay_router::outbound::Result,
+
+    /// Packets to be looped back and delivered to overlay transports.
+    pub loopback: ts_overlay_router::inbound::Result,
+}
+
+/// The result of processing inbound packets.
+pub struct InboundResult {
+    /// Decrypted packets to be delivered to overlay transports.
+    pub to_local: ts_overlay_router::inbound::Result,
+    /// Encrypted packets to be sent to wireguard peers by the underlay.
+    pub to_peers: ts_underlay_router::outbound::Result,
+
+    /// Encrypted disco packets to be handled externally.
+    pub disco: Vec<PacketMut>,
+
+    /// STUN packets to be handled externally.
+    pub stun: Vec<PacketMut>,
+}

@@ -336,3 +336,173 @@ impl Message<Arc<PeerState>> for DataplaneActor {
         tracing::trace!("applied new peer state");
     }
 }
+
+// ThinkTerm (TCP replies): exercise filtering after real WireGuard authentication.
+#[cfg(test)]
+mod tests {
+    use std::{net::IpAddr, sync::Arc, time::Instant};
+
+    use ts_bart::{RoutingTable, Table};
+    use ts_dataplane::DataPlane;
+    use ts_keys::NodeKeyPair;
+    use ts_overlay_router::inbound::RouteAction;
+    use ts_packet::PacketMut;
+    use ts_packetfilter::{BTreeFilter, DropAllFilter, DstMatch, IpProto, Rule, SrcMatch};
+    use ts_tunnel::{Endpoint, PeerConfig, PeerId};
+
+    fn packet(src: &str, dst: &str, protocol: u8, flags: u8) -> PacketMut {
+        let transport_len = if protocol == 6 { 20 } else { 8 };
+        let mut bytes = match (src.parse().unwrap(), dst.parse().unwrap()) {
+            (IpAddr::V4(src), IpAddr::V4(dst)) => {
+                let mut bytes = PacketMut::new(20 + transport_len);
+                bytes[0] = 0x45;
+                bytes[2..4].copy_from_slice(&((20 + transport_len) as u16).to_be_bytes());
+                bytes[8] = 64;
+                bytes[9] = protocol;
+                bytes[12..16].copy_from_slice(&src.octets());
+                bytes[16..20].copy_from_slice(&dst.octets());
+                bytes
+            }
+            (IpAddr::V6(src), IpAddr::V6(dst)) => {
+                let mut bytes = PacketMut::new(40 + transport_len);
+                bytes[0] = 0x60;
+                bytes[4..6].copy_from_slice(&(transport_len as u16).to_be_bytes());
+                bytes[6] = protocol;
+                bytes[7] = 64;
+                bytes[8..24].copy_from_slice(&src.octets());
+                bytes[24..40].copy_from_slice(&dst.octets());
+                bytes
+            }
+            _ => panic!("address families must match"),
+        };
+        let offset = bytes.len() - transport_len;
+        bytes[offset..offset + 2].copy_from_slice(&1234u16.to_be_bytes());
+        bytes[offset + 2..offset + 4].copy_from_slice(&49152u16.to_be_bytes());
+        if protocol == 6 {
+            bytes[offset + 12] = 0x50;
+            bytes[offset + 13] = flags;
+        } else {
+            bytes[offset + 4..offset + 6].copy_from_slice(&8u16.to_be_bytes());
+        }
+        bytes
+    }
+
+    fn endpoints(src: &str, dst: &str) -> (Endpoint, DataPlane) {
+        let sender_key = NodeKeyPair::random();
+        let receiver_key = NodeKeyPair::random();
+        let mut sender = Endpoint::new(sender_key.clone());
+        let mut receiver = DataPlane::new(receiver_key.clone());
+        sender.upsert_peer(PeerConfig::new(PeerId(1), receiver_key.public, [0; 32]));
+        receiver
+            .wireguard
+            .upsert_peer(PeerConfig::new(PeerId(1), sender_key.public, [0; 32]));
+        let now = Instant::now();
+        let initiation = sender.send(now, [(PeerId(1), vec![PacketMut::new(0)])]);
+        let response = receiver
+            .wireguard
+            .recv(now, initiation.to_peers.into_values().flatten());
+        let confirmation = sender.recv(now, response.to_peers.into_values().flatten());
+        receiver
+            .wireguard
+            .recv(now, confirmation.to_peers.into_values().flatten());
+
+        let prefix = if src.contains(':') { 128 } else { 32 };
+        let mut source_routes = Table::default();
+        source_routes.insert(
+            format!("{src}/{prefix}").parse().unwrap(),
+            ts_transport::PeerId(1),
+        );
+        receiver.src_filter_in = Arc::new(source_routes);
+        let mut destination_routes = Table::default();
+        destination_routes.insert(
+            format!("{dst}/{prefix}").parse().unwrap(),
+            RouteAction::ToOverlay(1.into()),
+        );
+        receiver.or_in.swap(destination_routes);
+        (sender, receiver)
+    }
+
+    fn delivered(sender: &mut Endpoint, receiver: &mut DataPlane, mut packet: PacketMut) -> bool {
+        let expected = packet.clone();
+        packet.grow_back((16 - packet.len() % 16) % 16);
+        let sent = sender.send(Instant::now(), [(PeerId(1), vec![packet])]);
+        assert!(!sent.to_peers.is_empty(), "encrypted packet was not sent");
+        let received = receiver.process_inbound(sent.to_peers.into_values().flatten());
+        let packets: Vec<_> = received.to_local.into_values().flatten().collect();
+        if packets.is_empty() {
+            false
+        } else {
+            assert_eq!(packets, vec![expected]);
+            true
+        }
+    }
+
+    #[test]
+    fn tcp_replies_reach_netstack_without_reverse_grants() {
+        for (src, dst) in [
+            ("100.64.0.1", "100.64.0.3"),
+            ("fd7a:115c:a1e0::1", "fd7a:115c:a1e0::3"),
+        ] {
+            let (mut sender, mut receiver) = endpoints(src, dst);
+            let prefix = if src.contains(':') { 128 } else { 32 };
+            receiver.packet_filter = Arc::new(BTreeFilter::from([(
+                "control".into(),
+                vec![Rule {
+                    src: SrcMatch {
+                        pfxs: vec![format!("{src}/{prefix}").parse().unwrap()],
+                        caps: vec![],
+                    },
+                    protos: vec![IpProto::TCP],
+                    dst: vec![DstMatch {
+                        ips: vec![format!("{dst}/{prefix}").parse().unwrap()],
+                        ports: 49152..=49152,
+                    }],
+                }],
+            )]));
+            assert!(
+                delivered(&mut sender, &mut receiver, packet(src, dst, 6, 0x02)),
+                "permitted SYN control failed"
+            );
+            receiver.packet_filter = Arc::new(DropAllFilter);
+            for flags in [0x12, 0x10, 0x18, 0x11, 0x14] {
+                assert!(
+                    delivered(&mut sender, &mut receiver, packet(src, dst, 6, flags)),
+                    "TCP response {flags:#x} to {dst} was dropped without a reverse grant"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsolicited_syn_udp_and_spoofed_sources_remain_denied() {
+        for (src, dst, spoofed, other_dst) in [
+            ("100.64.0.1", "100.64.0.3", "100.64.0.2", "100.64.0.4"),
+            (
+                "fd7a:115c:a1e0::1",
+                "fd7a:115c:a1e0::3",
+                "fd7a:115c:a1e0::2",
+                "fd7a:115c:a1e0::4",
+            ),
+        ] {
+            let (mut sender, mut receiver) = endpoints(src, dst);
+            for flags in [0x02, 0x03] {
+                assert!(
+                    !delivered(&mut sender, &mut receiver, packet(src, dst, 6, flags)),
+                    "unsolicited SYN admitted"
+                );
+            }
+            assert!(
+                !delivered(&mut sender, &mut receiver, packet(src, dst, 17, 0)),
+                "UDP admitted without a grant"
+            );
+            assert!(
+                !delivered(&mut sender, &mut receiver, packet(spoofed, dst, 6, 0x12)),
+                "spoofed source admitted"
+            );
+            assert!(
+                !delivered(&mut sender, &mut receiver, packet(src, other_dst, 6, 0x12)),
+                "unrouted destination admitted"
+            );
+        }
+    }
+}

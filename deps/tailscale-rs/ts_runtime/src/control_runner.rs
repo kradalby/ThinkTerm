@@ -1,5 +1,5 @@
 use core::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use futures::StreamExt;
 use kameo::{
@@ -19,6 +19,7 @@ use crate::{
     derp_latency::{DerpLatencyMeasurement, DerpLatencyMeasurer},
     direct,
     env::Env,
+    retained_bus::GetRetained,
 };
 
 /// Actor responsible for maintaining the connection to control.
@@ -82,28 +83,37 @@ impl kameo::Actor for ControlRunner {
     type Error = ControlRunnerError;
 
     async fn on_start(params: Params, slf: ActorRef<Self>) -> Result<Self, Self::Error> {
-        let client = params
-            .env
-            .ask::<DialerActor, _>(
-                None,
-                DialNext {
-                    url: params.config.server_url.clone(),
-                },
-                true,
-            )
-            .await?;
-
         Task::supervise_with(&slf, {
             let aref = slf.downgrade();
-            let client = client.clone();
             let params = params.clone();
 
             move || {
                 let aref = aref.clone();
-                let client = client.clone();
                 let params = params.clone();
 
                 async move {
+                    // ThinkTerm (control reconnect): retry outside on_start so shutdown can cancel an outage.
+                    let mut pause = Duration::from_secs(1);
+                    let client = loop {
+                        match params
+                            .env
+                            .ask::<DialerActor, _>(
+                                None,
+                                DialNext {
+                                    url: params.config.server_url.clone(),
+                                },
+                                true,
+                            )
+                            .await
+                        {
+                            Ok(client) => break client,
+                            Err(err) => {
+                                tracing::warn!(error = %err, ?pause, "control dial failed; retrying");
+                                tokio::time::sleep(pause).await;
+                                pause = (pause * 2).min(Duration::from_secs(30));
+                            }
+                        }
+                    };
                     let mut followup = None;
 
                     loop {
@@ -151,6 +161,21 @@ impl kameo::Actor for ControlRunner {
         params.env.subscribe::<DerpLatencyMeasurement>(&slf).await?;
         params.env.subscribe::<direct::NewEndpoints>(&slf).await?;
 
+        // ThinkTerm (control reconnect): restarted actor ids do not receive retained subscriptions again.
+        let endpoints = params
+            .env
+            .bus
+            .ask(GetRetained::<direct::NewEndpoints>::new())
+            .await
+            .map_err(crate::Error::from)?
+            .map_or_else(Vec::new, |endpoints| endpoints.0.to_vec());
+        let derp_latency_measurement = params
+            .env
+            .bus
+            .ask(GetRetained::<DerpLatencyMeasurement>::new())
+            .await
+            .map_err(crate::Error::from)?;
+
         DerpLatencyMeasurer::supervise(&slf, params.env.clone())
             .spawn()
             .await;
@@ -162,8 +187,8 @@ impl kameo::Actor for ControlRunner {
                 pending_auth_requests: Default::default(),
             },
             params,
-            derp_latency_measurement: None,
-            endpoints: Default::default(),
+            derp_latency_measurement,
+            endpoints,
             self_node: None,
             pending_node_requests: Default::default(),
         })
@@ -578,15 +603,59 @@ impl DialerActor {
 // ThinkTerm (sign-in state): the tests are ours.
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use ts_control::RegistrationError;
 
-    use super::registration_failure;
+    use super::*;
+
+    struct OutageSupervisor;
+
+    impl kameo::Actor for OutageSupervisor {
+        type Args = Params;
+        type Error = crate::Error;
+
+        async fn on_start(params: Params, slf: ActorRef<Self>) -> Result<Self, Self::Error> {
+            params.env.bus.link(&slf).await;
+            params.env.scheduler.link(&slf).await;
+            params.env.registry.link(&slf).await;
+            DialerActor::supervise(&slf, params.env.clone())
+                .spawn()
+                .await;
+            ControlRunner::supervise(&slf, params).spawn().await;
+            Ok(Self)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_control_server_does_not_kill_the_runtime() {
+        let supervisor = OutageSupervisor::spawn(Params {
+            config: ts_control::Config {
+                server_url: "http://127.0.0.1:0".parse().unwrap(),
+                ..Default::default()
+            },
+            auth_key: None,
+            env: Env::new(ts_keys::NodeState::generate()),
+        });
+        supervisor.wait_for_startup_result().await.unwrap();
+        let died = tokio::time::timeout(Duration::from_secs(2), supervisor.wait_for_shutdown())
+            .await
+            .is_ok();
+        supervisor.kill();
+        tokio::time::timeout(Duration::from_secs(2), supervisor.wait_for_shutdown())
+            .await
+            .expect("runtime shutdown stalled while control is unreachable");
+        assert!(!died, "control dial failures killed the runtime supervisor");
+    }
 
     #[test]
     fn a_sign_in_turned_away_says_why() {
         let refused = registration_failure(&RegistrationError::MachineNotAuthorized(None));
         assert!(refused.contains("auth key"), "{refused}");
         let unreachable = registration_failure(&RegistrationError::NetworkError);
-        assert!(unreachable.contains("could not be reached"), "{unreachable}");
+        assert!(
+            unreachable.contains("could not be reached"),
+            "{unreachable}"
+        );
     }
 }
