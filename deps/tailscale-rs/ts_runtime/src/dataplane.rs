@@ -438,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_replies_reach_netstack_without_reverse_grants() {
+    fn non_initiating_tcp_reaches_netstack_without_prior_flow_or_grants() {
         for (src, dst) in [
             ("100.64.0.1", "100.64.0.3"),
             ("fd7a:115c:a1e0::1", "fd7a:115c:a1e0::3"),
@@ -463,11 +463,22 @@ mod tests {
                 delivered(&mut sender, &mut receiver, packet(src, dst, 6, 0x02)),
                 "permitted SYN control failed"
             );
+            // A fresh session rules out state retained from the permitted SYN.
+            let (mut sender, mut receiver) = endpoints(src, dst);
             receiver.packet_filter = Arc::new(DropAllFilter);
-            for flags in [0x12, 0x10, 0x18, 0x11, 0x14] {
+            for flags in [0x12, 0x10, 0x18, 0x11, 0x14, 0x01, 0x04, 0x00] {
+                let mut response = packet(src, dst, 6, flags);
+                if flags == 0x18 {
+                    response.extend_from_slice(b"data");
+                    if src.contains(':') {
+                        response[4..6].copy_from_slice(&24u16.to_be_bytes());
+                    } else {
+                        response[2..4].copy_from_slice(&44u16.to_be_bytes());
+                    }
+                }
                 assert!(
-                    delivered(&mut sender, &mut receiver, packet(src, dst, 6, flags)),
-                    "TCP response {flags:#x} to {dst} was dropped without a reverse grant"
+                    delivered(&mut sender, &mut receiver, response),
+                    "non-initiating TCP {flags:#x} to {dst} was dropped without a grant"
                 );
             }
         }
@@ -485,7 +496,7 @@ mod tests {
             ),
         ] {
             let (mut sender, mut receiver) = endpoints(src, dst);
-            for flags in [0x02, 0x03] {
+            for flags in [0x02, 0x03, 0x06, 0xc2] {
                 assert!(
                     !delivered(&mut sender, &mut receiver, packet(src, dst, 6, flags)),
                     "unsolicited SYN admitted"
@@ -497,12 +508,104 @@ mod tests {
             );
             assert!(
                 !delivered(&mut sender, &mut receiver, packet(spoofed, dst, 6, 0x12)),
-                "spoofed source admitted"
+                "unknown source admitted"
+            );
+            let prefix = if src.contains(':') { 128 } else { 32 };
+            receiver.wireguard.upsert_peer(PeerConfig::new(
+                PeerId(2),
+                NodeKeyPair::random().public,
+                [0; 32],
+            ));
+            let mut source_routes = Table::default();
+            source_routes.insert(
+                format!("{src}/{prefix}").parse().unwrap(),
+                ts_transport::PeerId(1),
+            );
+            source_routes.insert(
+                format!("{spoofed}/{prefix}").parse().unwrap(),
+                ts_transport::PeerId(2),
+            );
+            receiver.src_filter_in = Arc::new(source_routes);
+            assert!(
+                !delivered(&mut sender, &mut receiver, packet(spoofed, dst, 6, 0x12)),
+                "another configured peer's source admitted"
+            );
+            assert!(
+                delivered(&mut sender, &mut receiver, packet(src, dst, 6, 0x12)),
+                "authenticated source-matched TCP control failed"
             );
             assert!(
                 !delivered(&mut sender, &mut receiver, packet(src, other_dst, 6, 0x12)),
                 "unrouted destination admitted"
             );
+            let mut destination_routes = Table::default();
+            destination_routes.insert(
+                format!("{dst}/{prefix}").parse().unwrap(),
+                RouteAction::Drop,
+            );
+            receiver.or_in.swap(destination_routes);
+            assert!(
+                !delivered(&mut sender, &mut receiver, packet(src, dst, 6, 0x12)),
+                "explicit Drop destination admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_and_fragmented_tcp_do_not_gain_the_flag_exception() {
+        for (src, dst) in [
+            ("100.64.0.1", "100.64.0.3"),
+            ("fd7a:115c:a1e0::1", "fd7a:115c:a1e0::3"),
+        ] {
+            let (mut sender, mut receiver) = endpoints(src, dst);
+            let valid = packet(src, dst, 6, 0x10);
+            assert!(
+                delivered(&mut sender, &mut receiver, valid.clone()),
+                "valid ACK control failed"
+            );
+            let ipv6 = src.contains(':');
+            let offset = if ipv6 { 40 } else { 20 };
+            let mut truncated = valid.clone();
+            truncated.resize(offset + 14);
+            let mut short_header = valid.clone();
+            short_header[offset + 12] = 0x40;
+            let mut long_header = valid.clone();
+            long_header[offset + 12] = 0xf0;
+            let mut first_fragment = valid.clone();
+            first_fragment.extend_from_slice(&[0; 4]);
+            if ipv6 {
+                first_fragment.grow_back(8);
+                first_fragment.copy_within(40..64, 48);
+                first_fragment[6] = 44;
+                first_fragment[40..48].copy_from_slice(&[6, 0, 0, 1, 0, 0, 0, 1]);
+            } else {
+                first_fragment[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+            }
+            let mut later_fragment = first_fragment.clone();
+            if ipv6 {
+                later_fragment[42..44].copy_from_slice(&24u16.to_be_bytes());
+            } else {
+                later_fragment[6..8].copy_from_slice(&3u16.to_be_bytes());
+            }
+            for (name, mut malformed) in [
+                ("truncated TCP", truncated),
+                ("data offset below minimum", short_header),
+                ("data offset beyond payload", long_header),
+                ("first fragment with ACK-like bytes", first_fragment),
+                ("later fragment with ACK-like bytes", later_fragment),
+            ] {
+                // IP lengths must exclude WireGuard padding even for truncated TCP.
+                let len = malformed.len();
+                if ipv6 {
+                    malformed[4..6].copy_from_slice(&((len - 40) as u16).to_be_bytes());
+                } else {
+                    malformed[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+                }
+                assert!(
+                    !delivered(&mut sender, &mut receiver, malformed),
+                    "{name} to {dst} admitted without a grant"
+                );
+            }
         }
     }
 }
