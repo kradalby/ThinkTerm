@@ -134,7 +134,7 @@ pub fn control_url_as_kept(text: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     let url = control_url(text)?;
-    if url.scheme() != "https" && !(cfg!(feature = "testkit") && url.scheme() == "http") {
+    if url.scheme() != "https" {
         anyhow::bail!(
             "the control server address {text:?}: a control server is reached over HTTPS"
         );
@@ -172,7 +172,6 @@ fn fetch_control_key(url: &url::Url) -> Result<()> {
     use std::convert::TryFrom;
     let mut key_url = url.join("/key")?;
     // Over HTTPS whatever the address says, as the node asks.
-    #[cfg(not(feature = "testkit"))]
     key_url
         .set_scheme("https")
         .map_err(|()| anyhow::anyhow!("not an address HTTPS can reach"))?;
@@ -356,11 +355,7 @@ mod tests {
             Some("https://headscale.example.com/".to_string())
         );
         // The key would be asked for over HTTPS all the same.
-        assert_eq!(
-            control_url_as_kept("http://headscale.example.com:8080").is_ok(),
-            cfg!(feature = "testkit")
-        );
-        assert!(control_url_as_kept("ftp://headscale.example.com").is_err());
+        assert!(control_url_as_kept("http://headscale.example.com:8080").is_err());
     }
 
     /// Where a holder would listen, in a folder of its own: socket paths

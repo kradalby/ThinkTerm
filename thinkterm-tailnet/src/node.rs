@@ -416,8 +416,9 @@ impl Node {
 
     /// Whether the node was given up, to be started anew: it was stuck for
     /// its `broken_after` (see `watchdog`), or one of its loops panicked.
-    /// Control dials retry indefinitely, but a component whose supervised
-    /// restarts ran out can stay stopped.
+    /// The library tries the control server only a couple of times before it
+    /// stops trying, and a part of it whose restarts ran out stays stopped:
+    /// neither comes back by itself.
     pub fn is_broken(&self) -> bool {
         self.shared.broken.load(Ordering::SeqCst)
     }
@@ -607,7 +608,8 @@ impl Stuck {
 
 /// Gives the node up once it has been stuck (see `is_stuck`) for
 /// `broken_after`, wherever it is stuck: building the library, waiting on a
-/// stalled control connection, or with part of the library
+/// control server the library stopped trying, on a control connection that
+/// went with the network it was made on, or with part of the library
 /// stopped. One that was in goes only once `control_answers`: until then
 /// one started in its place could not get in either, while this one may
 /// still carry connections to the machines it knew.
@@ -642,8 +644,8 @@ where
 }
 
 /// Whether a node is stuck at `status`: anywhere short of in, or as far as
-/// a login. A reconnecting node can still use addresses and peers configured
-/// before its control connection was lost.
+/// a login. Connections through one that is not in time out: the library
+/// asks its control part for every one.
 fn is_stuck(status: &Status) -> bool {
     !matches!(status, Status::Connected { .. } | Status::NeedsLogin { .. })
 }

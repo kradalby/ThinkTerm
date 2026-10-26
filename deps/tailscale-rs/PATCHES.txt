@@ -3,8 +3,7 @@ Patches to the vendored tailscale-rs crates
 
 What is here
 ------------
-The folders here -- tailscale, ts_runtime, ts_control, ts_netstack_smoltcp_core, ts_derp,
-ts_netmon and ts_dataplane --
+The folders here -- tailscale, ts_runtime, ts_control, ts_netstack_smoltcp_core and ts_derp --
 are copies of the tailscale-rs crates of the same names, version 0.6.1 from crates.io, with
 ThinkTerm's changes on top. The root Cargo.toml points crates.io's versions at them
 ([patch.crates-io]) and keeps them out of the workspace (exclude). Every other tailscale-rs
@@ -23,53 +22,15 @@ below:
 
 The whole difference from upstream, at any time, against a fresh copy of 0.6.1:
 
-    for c in tailscale ts_runtime ts_control ts_netstack_smoltcp_core ts_derp ts_netmon ts_dataplane; do
+    for c in tailscale ts_runtime ts_control ts_netstack_smoltcp_core ts_derp; do
         curl -sL "https://static.crates.io/crates/$c/$c-0.6.1.crate" | tar xz -C /tmp
         diff -ru "/tmp/$c-0.6.1" "deps/tailscale-rs/$c"
     done
 
 Upstream files this copy does not carry (README.md, examples, tests, Cargo.lock,
 Cargo.toml.orig, .cargo_vcs_info.json) show up as "Only in", and so do the LICENSE and
-PATENTS that ts_runtime, ts_control, ts_netstack_smoltcp_core, ts_derp, ts_netmon and
-ts_dataplane got from the tailscale crate, as they ship without them. The ts_netmon
-and ts_dataplane copies retain their upstream ancillary files. All of that is expected.
-
-ts_netmon provenance
--------------------
-Source archive: https://static.crates.io/crates/ts_netmon/ts_netmon-0.6.1.crate
-SHA-256: 9db3f993efce5c30bd72dda4d9b2036945aa13ef160b2626d77b2f6adaf47fea
-Repository: https://github.com/tailscale/tailscale-rs
-Published VCS commit: d34658bbb2eb4593ae6df959aa93e9ee1e0457c6, path ts_netmon.
-
-Every imported file matches that archive except src/linux/mod.rs::init_state.
-The regression is in ts_runtime/src/netmon.rs. Only Cargo.lock, Cargo.toml.orig and
-.cargo_vcs_info.json are omitted. LICENSE and PATENTS match this published archive:
-https://static.crates.io/crates/tailscale/tailscale-0.6.1.crate
-SHA-256: 7c41f9ac0c6e105ebcb5c368e8636d4926c28ec77aa000ddcc126df1fb527b2e
-
-ts_netmon was already a transitive dependency at this version. Cargo's existing
-[patch.crates-io] mechanism replaces crate sources, not individual functions. A Nix-only
-patch would leave native Cargo builds and application packaging on the broken code.
-Replacing the monitor inside ts_runtime would duplicate the Linux implementation and
-add platform-selection logic. Keeping the upstream crate intact makes the maintained
-patch just the lazy dump sequencing and preserves the other platform implementations.
-
-ts_dataplane provenance
-----------------------
-Source archive: https://static.crates.io/crates/ts_dataplane/ts_dataplane-0.6.1.crate
-SHA-256: ac692c013513afe18dc7ead7a74f3e67c048f943feae4d01b1c819d7bc445c94
-Repository: https://github.com/tailscale/tailscale-rs
-Published VCS commit: d34658bbb2eb4593ae6df959aa93e9ee1e0457c6, path ts_dataplane.
-
-Every imported file matches that archive except the TCP branch in src/lib.rs.
-The encrypted-packet regressions are in ts_runtime/src/dataplane.rs. Only Cargo.lock,
-Cargo.toml.orig and .cargo_vcs_info.json are omitted. LICENSE and PATENTS match the
-same published tailscale archive and checksum listed above.
-
-This was already a transitive dependency at this version. The existing Cargo path
-patch makes the correction available to native and Nix builds. ts_runtime's filter
-interface receives no TCP flags, so it cannot distinguish replies from new inbound
-connections. The correction belongs where ts_dataplane decodes the transport header.
+PATENTS that ts_runtime, ts_control, ts_netstack_smoltcp_core and ts_derp got from the
+tailscale crate, as they ship without them. All of that is expected.
 
 The changes
 -----------
@@ -177,45 +138,14 @@ derp regions (ts_runtime)
     could put its transport in first, and out it went.
     Drop when: upstream's Multiderp outlives a region it gave up and starts it again.
 
-netlink dump (ts_netmon)
-    Linux permits only one active netlink dump per socket. Initial link, address and route
-    requests run in order, creating each only after the previous response is exhausted.
-    Chaining already-created streams is insufficient: rtnetlink's execute sends eagerly.
-    Overlapping dumps can fail with EBUSY and leave the node without advertised endpoints.
-    Drop when: upstream serializes initial dumps, including request creation.
-
-control reconnect (ts_runtime)
-    Failed control dials retry with a bounded delay in the supervised registration task rather
-    than exhausting supervision and stopping the dataplane. Keeping retries out of on_start
-    lets actor shutdown cancel them. A restarted control actor reloads
-    retained endpoints and DERP measurements: its unchanged actor id does not receive retained
-    subscriptions again. Registration rejection still reports the existing failure reason.
-    The runtime's retained bus also keeps the configured local address pair separately from
-    raw map updates, whose node-less deltas replace the last event. A restarted control actor
-    can answer fresh TCP source-address requests while control is unavailable without claiming
-    a current self-node or successful registration. New authoritative addresses replace the
-    pair; a new runtime starts without it, even with the same persisted keys.
-    Drop when: upstream retries control outages without exhausting supervision and retains
-    the network state needed by the replacement map stream and fresh dataplane connections.
-
-TCP replies (ts_dataplane)
-    Apply inbound network grants to initiating TCP SYNs (SYN set, ACK clear), not replies.
-    A permitted outbound connection otherwise loses its SYN-ACK when control correctly
-    sends no inbound grants. This matches Go Tailscale's runIn4/runIn6 and IsTCPSyn at
-    commit 37fc7a7a7260. This is a stateless TCP rule; the receiving TCP stack validates
-    connection state. WireGuard authentication, source ownership checks, destination
-    routing, UDP filtering and rejection of new ungranted TCP connections remain in place.
-    Drop when: upstream permits TCP return traffic without requiring a reverse grant.
-
-build
+build (all five)
     #![doc = include_str!("../README.md")] became a one-line //! doc: the READMEs are not
     vendored (the root .gitignore drops *.md). In Cargo.toml, tailscale loses its
     [[example]], [[test]] and [profile.bench] sections, ts_netstack_smoltcp_core its
     [dev-dependencies], and ts_runtime gains tokio's "time" feature. Upstream's proptest
     module in ts_runtime/src/peer_tracker/peer_db.rs is switched off, as proptest is not a
     dependency here. ts_derp loses its [[example]] sections, as the examples are not vendored,
-    and gains tokio's "time" and "io-util" features. ts_netmon and ts_dataplane retain their
-    upstream ancillary files; their regressions live in ts_runtime, which consumes them.
+    and gains tokio's "time" and "io-util" features.
 
 Tests
 -----
@@ -228,13 +158,6 @@ build. The changes in behaviour have tests:
     device info    node::tests
     sign-in state  control_runner::tests (the reason given)
     no panic       env::tests
-    netlink dump   netmon::tests in ts_runtime (initial links, addresses and routes)
-    TCP replies    dataplane::tests in ts_runtime (IPv4/IPv6 encrypted stateless TCP, denied
-                   SYN/UDP, source ownership, destination routing and malformed/fragmented TCP)
-    control reconnect control_runner::tests (supervisor survival; address retention after a
-                   node-less delta and control restart, fresh status, cold runtime isolation
-                   and authoritative address replacement); nix/e2e.py (fresh IPv4/IPv6 payloads
-                   after observed stream termination/retry and new policy after reconnect)
     derp dial      multiderp::uniderp::tests (an unreachable region, becoming home, a
                    connection that does not come up, the next server)
     derp reads     client::tests in ts_derp (a connection gone quiet, keep-alives)
@@ -255,7 +178,7 @@ Upgrading
 ---------
 1. Read upstream's CHANGELOG.md for the new version: its security fixes, and anything that
    touches the groups above. A group upstream now covers can be dropped instead of merged.
-2. For each vendored crate, merge three ways, file by file: the base is upstream's old
+2. For each of the five crates, merge three ways, file by file: the base is upstream's old
    version, ours is deps/tailscale-rs/<crate>, theirs is upstream's new version. With both
    versions unpacked in /tmp as above:
 
@@ -265,7 +188,7 @@ Upgrading
    Changes that do not overlap merge by themselves; overlapping ones are left between
    conflict markers. Copy files upstream added; move by hand our changes in a file upstream
    removed or renamed. For Cargo.toml, take upstream's new one and redo the build changes.
-3. Bump the version: these crates' entries under [patch.crates-io] in the root Cargo.toml and
+3. Bump the version: the five entries under [patch.crates-io] in the root Cargo.toml and
    the two in thinkterm-tailnet/Cargo.toml, then `cargo update` the other tailscale-rs
    crates to the same version. All tailscale-rs crates move together.
 4. Build, run the tests above and thinkterm-tailnet's and thinkterm-tailnet-node's, then

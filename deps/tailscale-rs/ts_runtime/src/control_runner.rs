@@ -1,5 +1,5 @@
 use core::net::{Ipv4Addr, Ipv6Addr};
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use futures::StreamExt;
 use kameo::{
@@ -11,7 +11,6 @@ use kameo::{
 };
 use ts_control::{
     ControlDialer, DialPlan, Endpoint, Error as ControlError, Node, RegistrationError, StateUpdate,
-    TailnetAddress,
     client::{HttpConn, handle_ping, map_stream, send_map_request},
 };
 
@@ -20,7 +19,6 @@ use crate::{
     derp_latency::{DerpLatencyMeasurement, DerpLatencyMeasurer},
     direct,
     env::Env,
-    retained_bus::GetRetained,
 };
 
 /// Actor responsible for maintaining the connection to control.
@@ -35,8 +33,6 @@ pub struct ControlRunner {
     endpoints: Vec<Endpoint>,
 
     self_node: Option<Node>,
-    // ThinkTerm (control reconnect): configured addresses outlive the current map stream, not the runtime.
-    local_addresses: Option<TailnetAddress>,
     pending_node_requests: Vec<PendingNodeRequest>,
 }
 
@@ -86,37 +82,28 @@ impl kameo::Actor for ControlRunner {
     type Error = ControlRunnerError;
 
     async fn on_start(params: Params, slf: ActorRef<Self>) -> Result<Self, Self::Error> {
+        let client = params
+            .env
+            .ask::<DialerActor, _>(
+                None,
+                DialNext {
+                    url: params.config.server_url.clone(),
+                },
+                true,
+            )
+            .await?;
+
         Task::supervise_with(&slf, {
             let aref = slf.downgrade();
+            let client = client.clone();
             let params = params.clone();
 
             move || {
                 let aref = aref.clone();
+                let client = client.clone();
                 let params = params.clone();
 
                 async move {
-                    // ThinkTerm (control reconnect): retry outside on_start so shutdown can cancel an outage.
-                    let mut pause = Duration::from_secs(1);
-                    let client = loop {
-                        match params
-                            .env
-                            .ask::<DialerActor, _>(
-                                None,
-                                DialNext {
-                                    url: params.config.server_url.clone(),
-                                },
-                                true,
-                            )
-                            .await
-                        {
-                            Ok(client) => break client,
-                            Err(err) => {
-                                tracing::warn!(error = %err, ?pause, "control dial failed; retrying");
-                                tokio::time::sleep(pause).await;
-                                pause = (pause * 2).min(Duration::from_secs(30));
-                            }
-                        }
-                    };
                     let mut followup = None;
 
                     loop {
@@ -164,27 +151,6 @@ impl kameo::Actor for ControlRunner {
         params.env.subscribe::<DerpLatencyMeasurement>(&slf).await?;
         params.env.subscribe::<direct::NewEndpoints>(&slf).await?;
 
-        // ThinkTerm (control reconnect): restarted actor ids do not receive retained subscriptions again.
-        let endpoints = params
-            .env
-            .bus
-            .ask(GetRetained::<direct::NewEndpoints>::new())
-            .await
-            .map_err(crate::Error::from)?
-            .map_or_else(Vec::new, |endpoints| endpoints.0.to_vec());
-        let derp_latency_measurement = params
-            .env
-            .bus
-            .ask(GetRetained::<DerpLatencyMeasurement>::new())
-            .await
-            .map_err(crate::Error::from)?;
-        let local_addresses = params
-            .env
-            .bus
-            .ask(GetRetained::<TailnetAddress>::new())
-            .await
-            .map_err(crate::Error::from)?;
-
         DerpLatencyMeasurer::supervise(&slf, params.env.clone())
             .spawn()
             .await;
@@ -196,10 +162,9 @@ impl kameo::Actor for ControlRunner {
                 pending_auth_requests: Default::default(),
             },
             params,
-            derp_latency_measurement,
-            endpoints,
+            derp_latency_measurement: None,
+            endpoints: Default::default(),
             self_node: None,
-            local_addresses,
             pending_node_requests: Default::default(),
         })
     }
@@ -213,8 +178,8 @@ impl ControlRunner {
         &mut self,
         ctx: &mut Context<Self, DelegatedReply<Option<Ipv4Addr>>>,
     ) -> DelegatedReply<Option<Ipv4Addr>> {
-        if let Some(addresses) = &self.local_addresses {
-            return ctx.reply(Some(addresses.ipv4.addr()));
+        if let Some(node) = &self.self_node {
+            return ctx.reply(Some(node.tailnet_address.ipv4.addr()));
         }
 
         let (deleg, replier) = ctx.reply_sender();
@@ -232,8 +197,8 @@ impl ControlRunner {
         &mut self,
         ctx: &mut Context<Self, DelegatedReply<Option<Ipv6Addr>>>,
     ) -> DelegatedReply<Option<Ipv6Addr>> {
-        if let Some(addresses) = &self.local_addresses {
-            return ctx.reply(Some(addresses.ipv6.addr()));
+        if let Some(node) = &self.self_node {
+            return ctx.reply(Some(node.tailnet_address.ipv6.addr()));
         }
 
         let (deleg, replier) = ctx.reply_sender();
@@ -524,11 +489,6 @@ impl Message<StreamMessage<Arc<StateUpdate>, (), ()>> for ControlRunner {
         }
 
         if let Some(node) = msg.node.as_ref() {
-            // ThinkTerm (control reconnect): node-less deltas must not erase configured addresses.
-            self.local_addresses = Some(node.tailnet_address.clone());
-            if let Err(e) = self.params.env.publish(node.tailnet_address.clone()).await {
-                tracing::error!(error = %e, "retaining local addresses");
-            }
             self.self_node = Some(node.clone());
         }
 
@@ -618,277 +578,15 @@ impl DialerActor {
 // ThinkTerm (sign-in state): the tests are ours.
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use ts_control::RegistrationError;
 
-    use super::*;
-
-    struct OutageSupervisor;
-
-    impl kameo::Actor for OutageSupervisor {
-        type Args = Params;
-        type Error = crate::Error;
-
-        async fn on_start(params: Params, slf: ActorRef<Self>) -> Result<Self, Self::Error> {
-            params.env.bus.link(&slf).await;
-            params.env.scheduler.link(&slf).await;
-            params.env.registry.link(&slf).await;
-            DialerActor::supervise(&slf, params.env.clone())
-                .spawn()
-                .await;
-            ControlRunner::supervise(&slf, params).spawn().await;
-            Ok(Self)
-        }
-    }
-
-    #[tokio::test]
-    async fn an_unreachable_control_server_does_not_kill_the_runtime() {
-        let supervisor = OutageSupervisor::spawn(Params {
-            config: ts_control::Config {
-                server_url: "http://127.0.0.1:0".parse().unwrap(),
-                ..Default::default()
-            },
-            auth_key: None,
-            env: Env::new(ts_keys::NodeState::generate()),
-        });
-        supervisor.wait_for_startup_result().await.unwrap();
-        let died = tokio::time::timeout(Duration::from_secs(2), supervisor.wait_for_shutdown())
-            .await
-            .is_ok();
-        supervisor.kill();
-        tokio::time::timeout(Duration::from_secs(2), supervisor.wait_for_shutdown())
-            .await
-            .expect("runtime shutdown stalled while control is unreachable");
-        assert!(!died, "control dial failures killed the runtime supervisor");
-    }
+    use super::registration_failure;
 
     #[test]
     fn a_sign_in_turned_away_says_why() {
         let refused = registration_failure(&RegistrationError::MachineNotAuthorized(None));
         assert!(refused.contains("auth key"), "{refused}");
         let unreachable = registration_failure(&RegistrationError::NetworkError);
-        assert!(
-            unreachable.contains("could not be reached"),
-            "{unreachable}"
-        );
-    }
-
-    fn node_update(node: Option<Node>) -> Arc<StateUpdate> {
-        Arc::new(StateUpdate {
-            derp: None,
-            node,
-            peer_update: None,
-            ping: None,
-            packetfilter: None,
-            pop_browser_url: None,
-            dial_plan: None,
-        })
-    }
-
-    #[tokio::test]
-    async fn configured_addresses_survive_a_control_restart_without_claiming_fresh_state() {
-        let env = Env::new(ts_keys::NodeState::generate());
-        let supervisor = OutageSupervisor::spawn(Params {
-            config: ts_control::Config {
-                server_url: "http://127.0.0.1:0".parse().unwrap(),
-                ..Default::default()
-            },
-            auth_key: None,
-            env: env.clone(),
-        });
-        supervisor.wait_for_startup_result().await.unwrap();
-        env.wait::<ControlRunner>(None).await.unwrap();
-        let runner = env.lookup::<ControlRunner>(None).await.unwrap();
-        assert_eq!(runner.ask(CurrentAuthUrl).await.unwrap(), None);
-        assert_eq!(runner.ask(CurrentSelfNode).await.unwrap(), None);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), async { runner.ask(Ipv4).await })
-                .await
-                .is_err()
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), async { runner.ask(Ipv6).await })
-                .await
-                .is_err()
-        );
-
-        let mut node = Node {
-            id: 1,
-            stable_id: ts_control::StableNodeId("self".into()),
-            hostname: "self".into(),
-            capability_version: Default::default(),
-            status: ts_control::NodeStatus::Unknown,
-            tailnet: None,
-            node_capabilities: Default::default(),
-            tags: vec![],
-            tailnet_address: ts_control::TailnetAddress {
-                ipv4: "100.64.0.1/32".parse().unwrap(),
-                ipv6: "fd7a:115c:a1e0::1/128".parse().unwrap(),
-            },
-            node_key: env.keys.node_keys.public,
-            node_key_expiry: None,
-            machine_key: None,
-            disco_key: None,
-            tailnet_lock_key_signature: None,
-            accepted_routes: vec![],
-            underlay_addresses: vec![],
-            derp_region: None,
-            device: Default::default(),
-        };
-        runner
-            .ask(StreamMessage::Next(node_update(Some(node.clone()))))
-            .await
-            .unwrap();
-        assert_eq!(
-            runner.ask(Ipv4).await.unwrap(),
-            Some("100.64.0.1".parse().unwrap())
-        );
-        assert_eq!(
-            runner.ask(Ipv6).await.unwrap(),
-            Some("fd7a:115c:a1e0::1".parse().unwrap())
-        );
-        assert_eq!(
-            runner.ask(CurrentSelfNode).await.unwrap(),
-            Some(node.clone())
-        );
-        runner
-            .ask(StreamMessage::Next(node_update(None)))
-            .await
-            .unwrap();
-        assert!(
-            env.bus
-                .ask(GetRetained::<Arc<StateUpdate>>::new())
-                .await
-                .unwrap()
-                .unwrap()
-                .node
-                .is_none()
-        );
-
-        runner
-            .ask(StreamMessage::<Arc<StateUpdate>, (), ()>::Finished(()))
-            .await
-            .unwrap();
-        let fresh_node = env
-            .ask::<ControlRunner, _>(None, CurrentSelfNode, true)
-            .await
-            .unwrap();
-        assert_eq!(
-            fresh_node, None,
-            "restart presented a stale node as a new map"
-        );
-        assert_eq!(
-            env.ask::<ControlRunner, _>(None, CurrentAuthUrl, true)
-                .await
-                .unwrap(),
-            None
-        );
-        let addresses = tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::join!(
-                env.ask::<ControlRunner, _>(None, Ipv4, true),
-                env.ask::<ControlRunner, _>(None, Ipv6, true),
-            )
-        })
-        .await;
-        let alive = supervisor.is_alive();
-
-        node.tailnet_address.ipv4 = "100.64.0.2/32".parse().unwrap();
-        node.tailnet_address.ipv6 = "fd7a:115c:a1e0::2/128".parse().unwrap();
-        runner
-            .ask(StreamMessage::Next(node_update(Some(node.clone()))))
-            .await
-            .unwrap();
-        assert_eq!(
-            runner.ask(Ipv4).await.unwrap(),
-            Some("100.64.0.2".parse().unwrap())
-        );
-        assert_eq!(
-            runner.ask(Ipv6).await.unwrap(),
-            Some("fd7a:115c:a1e0::2".parse().unwrap())
-        );
-        runner
-            .ask(StreamMessage::Next(node_update(None)))
-            .await
-            .unwrap();
-        runner
-            .ask(StreamMessage::<Arc<StateUpdate>, (), ()>::Finished(()))
-            .await
-            .unwrap();
-        assert_eq!(
-            env.ask::<ControlRunner, _>(None, CurrentSelfNode, true)
-                .await
-                .unwrap(),
-            None
-        );
-        let replaced = tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::join!(
-                env.ask::<ControlRunner, _>(None, Ipv4, true),
-                env.ask::<ControlRunner, _>(None, Ipv6, true),
-            )
-        })
-        .await
-        .unwrap();
-        assert_eq!(replaced.0.unwrap(), Some("100.64.0.2".parse().unwrap()));
-        assert_eq!(
-            replaced.1.unwrap(),
-            Some("fd7a:115c:a1e0::2".parse().unwrap())
-        );
-        supervisor.kill();
-        tokio::time::timeout(Duration::from_secs(2), supervisor.wait_for_shutdown())
-            .await
-            .unwrap();
-
-        // A new runtime with the same persisted keys must configure its own netstack first.
-        let cold_env = Env::new((*env.keys).clone());
-        let cold = OutageSupervisor::spawn(Params {
-            config: ts_control::Config {
-                server_url: "http://127.0.0.1:0".parse().unwrap(),
-                ..Default::default()
-            },
-            auth_key: None,
-            env: cold_env.clone(),
-        });
-        cold.wait_for_startup_result().await.unwrap();
-        cold_env.wait::<ControlRunner>(None).await.unwrap();
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(100),
-                cold_env.ask::<ControlRunner, _>(None, Ipv4, true)
-            )
-            .await
-            .is_err()
-        );
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(100),
-                cold_env.ask::<ControlRunner, _>(None, Ipv6, true)
-            )
-            .await
-            .is_err()
-        );
-        assert_eq!(
-            cold_env
-                .ask::<ControlRunner, _>(None, CurrentSelfNode, true)
-                .await
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            cold_env
-                .ask::<ControlRunner, _>(None, CurrentAuthUrl, true)
-                .await
-                .unwrap(),
-            None
-        );
-        cold.kill();
-        tokio::time::timeout(Duration::from_secs(2), cold.wait_for_shutdown())
-            .await
-            .unwrap();
-        assert!(alive, "control restart killed the runtime");
-        let (ipv4, ipv6) = addresses
-            .expect("configured local addresses waited for unavailable control after restart");
-        assert_eq!(ipv4.unwrap(), Some("100.64.0.1".parse().unwrap()));
-        assert_eq!(ipv6.unwrap(), Some("fd7a:115c:a1e0::1".parse().unwrap()));
+        assert!(unreachable.contains("could not be reached"), "{unreachable}");
     }
 }

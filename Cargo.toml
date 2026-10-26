@@ -462,10 +462,6 @@ varbincode = {path="deps/varbincode", version="0.1.0"}
 # deps/tailscale-rs/PATCHES.txt).
 tailscale = {path="deps/tailscale-rs/tailscale", version="0.6.1"}
 ts_runtime = {path="deps/tailscale-rs/ts_runtime", version="0.6.1"}
-# Vendored to serialize Linux netlink dumps before publishing direct endpoints.
-ts_netmon = {path="deps/tailscale-rs/ts_netmon", version="0.6.1"}
-# Vendored so TCP replies do not require a reverse network grant.
-ts_dataplane = {path="deps/tailscale-rs/ts_dataplane", version="0.6.1"}
 # Vendored so that a connection notices a peer gone without a word, and a
 # connect nobody waits for any more ends: 0.6.1 sets neither a timeout nor
 # keep-alives on its TCP sockets.
