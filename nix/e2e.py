@@ -439,7 +439,8 @@ with subtest("down preserves identity; logout replaces it; bad keys fail"):
         f'jq -e \'has("node_keys") == false and has("auth_key") == false\' {DATA}/tailnet.json'
     )
     failure = cli("up", key="tskey-auth-invalid", ok=False)
-    assert "signing in failed:" in failure, failure
+    assert "the control server turned this machine away" in failure, failure
+    assert "auth key" in failure, failure
     assert report()["status"]["state"] != "connected"
     headscale.succeed("headscale health")
     direct.succeed("tailscale ping --until-direct=false -c 1 --timeout 5s relay")
