@@ -4,6 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    headscale.url = "github:juanfont/headscale/main";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -34,6 +35,14 @@
     };
     zlib = {
       url = "github:madler/zlib/v1.3.1";
+      flake = false;
+    };
+    lucide = {
+      url = "github:lucide-icons/lucide/071e4d27381bec932951a87c2598dfe8532b4974";
+      flake = false;
+    };
+    simple-icons = {
+      url = "github:simple-icons/simple-icons/9ad548078caad572c66a830314852b15937e639a";
       flake = false;
     };
   };
@@ -95,6 +104,11 @@
           cargo = pkgs.rust-bin.stable.latest.minimal;
           rustc = pkgs.rust-bin.stable.latest.minimal;
         };
+        prepareIcons = ''
+          rm -rf third_party/lucide third_party/simple-icons
+          ln -s ${inputs.lucide} third_party/lucide
+          ln -s ${inputs.simple-icons} third_party/simple-icons
+        '';
       in
       {
         packages.default = rustPlatform.buildRustPackage rec {
@@ -109,7 +123,7 @@
             allowBuiltinFetchGit = true;
           };
 
-          prePatch = ''
+          prePatch = prepareIcons + ''
             rm -rf deps/freetype/{freetype2,libpng,zlib} deps/harfbuzz/harfbuzz
 
             ln -s ${inputs.freetype2} deps/freetype/freetype2
@@ -185,15 +199,22 @@
                 meta
                 ;
 
-              nativeBuildInputs = [ pkgs.pkg-config ];
+              nativeBuildInputs = [
+                pkgs.pkg-config
+                pkgs.cmake
+              ];
+              dontUseCmakeConfigure = true;
 
               buildInputs = [ pkgs.openssl ];
+              prePatch = prepareIcons;
 
               cargoBuildFlags = [
                 "--package"
                 "wezterm"
                 "--package"
                 "wezterm-mux-server"
+                "--package"
+                "thinkterm-tailnet-node"
               ];
 
               doCheck = false;
