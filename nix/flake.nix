@@ -239,6 +239,14 @@
           meta.mainProgram = "thinkterm";
         };
 
+        checks = lib.optionalAttrs stdenv.isLinux {
+          tailnet = import ./tailnet-smoke.nix {
+            inherit pkgs;
+            inherit (inputs) headscale;
+            package = self.packages.${system}.default.headless;
+          };
+        };
+
         devShell = pkgs.mkShell {
           name = "wezterm-shell";
           inherit nativeBuildInputs;
