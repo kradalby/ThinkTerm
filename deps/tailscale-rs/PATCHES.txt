@@ -4,7 +4,7 @@ Patches to the vendored tailscale-rs crates
 What is here
 ------------
 The folders here -- tailscale, ts_runtime, ts_control, ts_netstack_smoltcp_core, ts_derp and
-ts_netmon -- are copies of the tailscale-rs crates of the same names, version 0.6.1 from crates.io, with
+ts_netmon and ts_tls_util -- are copies of the tailscale-rs crates of the same names, version 0.6.1 from crates.io, with
 ThinkTerm's changes on top. The root Cargo.toml points crates.io's versions at them
 ([patch.crates-io]) and keeps them out of the workspace (exclude). Every other tailscale-rs
 crate (ts_keys, ts_tunnel, ...) still comes from crates.io, held at the same version by
@@ -22,7 +22,7 @@ below:
 
 The whole difference from upstream, at any time, against a fresh copy of 0.6.1:
 
-    for c in tailscale ts_runtime ts_control ts_netstack_smoltcp_core ts_derp ts_netmon; do
+    for c in tailscale ts_runtime ts_control ts_netstack_smoltcp_core ts_derp ts_netmon ts_tls_util; do
         curl -sL "https://static.crates.io/crates/$c/$c-0.6.1.crate" | tar xz -C /tmp
         diff -ru "/tmp/$c-0.6.1" "deps/tailscale-rs/$c"
     done
@@ -34,6 +34,11 @@ from the tailscale crate, as they ship without them. All of that is expected.
 
 The changes
 -----------
+private CA (ts_tls_util)
+    `TS_TLS_EXTRA_CA_FILE` in the holder's environment adds PEM roots for key fetch,
+    HTTPS control, and DERP. No override leaves the bundled roots unchanged.
+    ThinkTerm's separate desktop control-server preflight uses platform TLS trust.
+
 ios (ts_netmon)
     The network monitor's macOS code is for every Apple system: each `target_os = "macos"`
     in the crate's sources and its Cargo.toml is `target_vendor = "apple"`, and nothing

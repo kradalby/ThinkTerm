@@ -486,3 +486,5 @@ ts_derp = {path="deps/tailscale-rs/ts_derp", version="0.6.1"}
 # Vendored so that the library builds for iOS: 0.6.1 watches the network on
 # macOS, Linux and Windows only, and iOS has what the macOS monitor uses.
 ts_netmon = {path="deps/tailscale-rs/ts_netmon", version="0.6.1"}
+# Vendored so the node can trust an explicitly configured private CA.
+ts_tls_util = {path="deps/tailscale-rs/ts_tls_util", version="0.6.1"}
